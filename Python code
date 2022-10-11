@@ -1,0 +1,281 @@
+import pandas
+import numpy as np
+import statsmodels.api as sm
+import matplotlib.pyplot as plt
+import stepwise as stepwise #make sure this file is located in the same folder as this script
+import datetime
+
+#Creating base timelines
+summerstarttime=datetime.datetime.strptime('01/05/2018','%d/%m/%Y').date()
+summerendtime=datetime.datetime.strptime('31/08/2018','%d/%m/%Y').date()
+
+#dataframes
+summerfintrx = pandas.read_csv('summerfintrx.csv',parse_dates=['Date'])
+summersesstrx = pandas.read_csv('summersesstrx.csv',parse_dates=['Date'])
+fallfintrx = pandas.read_csv('fallfintrx.csv',parse_dates=['Date'])
+fallsesstrx = pandas.read_csv('fallsesstrx.csv',parse_dates=['Date'])
+customerdata = pandas.read_csv('customerdata.csv',parse_dates=['Registrationdate'])
+
+#convert datetime to date (we don't need the hour)
+summerfintrx['Date'] = pandas.to_datetime(summerfintrx['Date']).dt.date
+summersesstrx['Date'] = pandas.to_datetime(summersesstrx['Date']).dt.date
+fallfintrx['Date'] = pandas.to_datetime(fallfintrx['Date']).dt.date
+fallsesstrx['Date'] = pandas.to_datetime(fallsesstrx['Date']).dt.date
+customerdata['Registrationdate'] = pandas.to_datetime(customerdata['Registrationdate']).dt.date
+
+######### Creation of a basetable + profiling####################
+summersesstrx=summersesstrx[summersesstrx['Duration']>0]
+#Create basetable combining  summeractive customers
+summeractive=summersesstrx.merge(customerdata,how='left',left_on='CustomerID',right_on='CustomerID') 
+
+#Replacing ProductID with ProductPrice
+summerfintrx.loc[summerfintrx['ProductID'] == 1, 'ProductID'] = 2.99
+summerfintrx.loc[summerfintrx['ProductID'] == 2, 'ProductID'] = 4.99
+summerfintrx.loc[summerfintrx['ProductID'] == 3, 'ProductID'] = 9.99
+summerfintrx.loc[summerfintrx['ProductID'] == 4, 'ProductID'] = 25
+summerfintrx.loc[summerfintrx['ProductID'] == 5, 'ProductID'] = 99 
+
+
+###RFM###
+RFM=summerfintrx.groupby('CustomerID').agg(frequency=('CustomerID','count'),
+                                                  recency=('Date',lambda date: (summerendtime - date.max()).days),
+                                                  monetaryvalue=('ProductID','sum'))
+
+RFMwithdemographics=RFM.merge(customerdata, how='left', left_on='CustomerID', right_on='CustomerID')
+
+
+#Creating a basetable with all needed data
+basetable=RFMwithdemographics[['CustomerID','frequency','recency','monetaryvalue','CustomerType']]
+basetable=basetable.assign(
+    segmfreq=lambda x: pandas.cut(basetable['frequency'], 
+                                              bins=[0,1,2,3,10],
+                                              labels=["1", "2", "3",">3"]),
+    segmrec=lambda x: pandas.cut(basetable['recency'], 
+                                              bins=[-1,6,13,30,50,85,180],
+                                              labels=["0-6 days", "7-13 days", "14-30 days",'31-50 days',"51-85 days", ">85 days"]),
+
+    )
+basetable['segmfreq']=pandas.Categorical(basetable['segmfreq'], categories=[">3", "3","2","1"])
+basetable['segmrec']=pandas.Categorical(basetable['segmrec'], categories=[">85 days", "51-85 days", '31-50 days',"14-30 days","7-13 days","0-6 days"])
+
+lcgcus=basetable.groupby(['CustomerType','segmfreq','segmrec'], observed=True, as_index=False).agg(quantity=('CustomerID','count'),
+                                                               profit=('monetaryvalue','sum'))
+                                                               
+
+
+##Computing total revenue in summer and fall##
+
+fallfintrx.loc[fallfintrx['ProductID'] == 1, 'ProductID'] = 2.99
+fallfintrx.loc[fallfintrx['ProductID'] == 2, 'ProductID'] = 4.99
+fallfintrx.loc[fallfintrx['ProductID'] == 3, 'ProductID'] = 9.99
+fallfintrx.loc[fallfintrx['ProductID'] == 4, 'ProductID'] = 25
+fallfintrx.loc[fallfintrx['ProductID'] == 5, 'ProductID'] = 99
+Total_revenue=fallfintrx['ProductID'].sum()+summerfintrx['ProductID'].sum()
+Total_revenue=round(Total_revenue,2)
+#we should calculate the number of days during which transactions were made 
+max_fall_date=fallfintrx['Date'].max()
+min_summer_date=summerfintrx['Date'].min()
+days_in_period= (max_fall_date-min_summer_date).days
+#Calculate daily revenue
+daily_revenues=Total_revenue / days_in_period
+daily_marketing_cost= 0.15*daily_revenues
+#To compute acquisition cost we take into account the registeration range
+register_period= (customerdata['Registrationdate'].max()-customerdata['Registrationdate'].min()).days
+acq_per_cust=(daily_marketing_cost*register_period)/ (customerdata['CustomerID'].count())
+acq_per_cust=round(acq_per_cust,2)
+#Profit
+summer_trx_group=summerfintrx.merge(customerdata,how='left', left_on='CustomerID', right_on='CustomerID')
+fall_trx_group=fallfintrx.merge(customerdata,how='left', left_on='CustomerID', right_on='CustomerID')
+total_trx=pandas.concat([summer_trx_group, fall_trx_group])
+revenue_groups=total_trx.groupby(['CustomerType'],observed=True,as_index=False).agg(totalrevenue=('ProductID','sum'), IAP=('CustomerID','nunique'))
+customer_groups=customerdata.groupby(['CustomerType'],observed=True,as_index=False).agg(custcount=('CustomerID','count'))  
+revenue_groups['CustCount']=customer_groups['custcount']
+revenue_groups['RevPerCust']=revenue_groups.totalrevenue/revenue_groups.CustCount
+revenue_groups['ProfitperCustomer']=0.3 * revenue_groups['RevPerCust']
+
+#Retention rate
+Basetable_Churn=summeractive.merge(fallfintrx, how='left', left_on='CustomerID', right_on='CustomerID')
+Basetable_Churn['ProductID']=Basetable_Churn['ProductID'].fillna(0)
+Basetable_Churn['Churn']=Basetable_Churn['ProductID']
+Basetable_Churn.loc[Basetable_Churn['Churn'] != 0, 'Churn'] = 1
+Segement_churn=Basetable_Churn[['CustomerID','CustomerType','Churn']]
+Segement_churn=Segement_churn.groupby(['CustomerID','CustomerType'], observed=True, as_index=False).agg(Churn=('Churn','mean'))
+Type1=Segement_churn[(Segement_churn['CustomerType']==1)&(Segement_churn['Churn']==1)]
+Type1_rentation=Type1['CustomerID'].count()/((Segement_churn['CustomerType']==1).count())
+print(Type1_rentation)
+Type2=Segement_churn[(Segement_churn['CustomerType']==2)&(Segement_churn['Churn']==1)]
+Type2_rentation=Type2['CustomerID'].count()/((Segement_churn['CustomerType']==1).count())
+print(Type2_rentation)
+Type3=Segement_churn[(Segement_churn['CustomerType']==3)&(Segement_churn['Churn']==1)]
+Type3_rentation=Type3['CustomerID'].count()/((Segement_churn['CustomerType']==1).count())
+print(Type3_rentation)
+Type4=Segement_churn[(Segement_churn['CustomerType']==4)&(Segement_churn['Churn']==1)]
+Type4_rentation=Type4['CustomerID'].count()/((Segement_churn['CustomerType']==1).count())
+print(Type4_rentation)
+
+#CLV
+def calc_clv(margin, r, d, acquisition,t):
+    clv=-acquisition
+    for i in range(0,t+1):
+         clv=clv+(pow(r,i)*margin)/(pow((1+d),i))
+    return(clv)
+
+clv_g1=calc_clv(1.23,0.125,0.1,2.84,1)
+print(clv_g1)
+
+clv_g2=calc_clv(1.06,0.125,0.1,2.84,1)
+print(clv_g2)
+
+clv_g3=calc_clv(2.4,0.125,0.1,2.84,1)
+print(clv_g3)
+
+clv_g4=calc_clv(1.58,0.125,0.1,2.84,1)
+print(clv_g4)
+
+
+#########Lifecycle grids####################
+age_group1 = pandas.cut(customerdata.Age, bins = [0,17,22,35,50,80], labels= ['6-17','18-23','24-35','36-50','>51'])                  
+customerdata.insert(1, 'AgeGroup', age_group1)
+#adding all needed information to basetable for plotting grids to basetable
+custdata_to_use = ['CustomerID','AgeGroup','fallbonus']
+basetable= pandas.merge(basetable, customerdata[custdata_to_use], on=['CustomerID'], how='left')
+print(basetable)
+
+purfreq=total_trx.groupby('CustomerID',as_index=False).agg(frequency=('CustomerID','count'))
+Freq_of_purch=purfreq.groupby('frequency',observed=True ,as_index=False).agg(NumberofCust=('CustomerID','count'))
+Freq_of_purch.loc[-1] = ['0', '3303']  # adding a row
+Freq_of_purch.index = Freq_of_purch.index + 1  # shifting index
+Freq_of_purch.sort_index(inplace=True) 
+
+plot2=(ggplot(basetable, aes(x='AgeGroup', fill='AgeGroup', y='monetaryvalue')) +
+theme_bw() +
+theme(panel_grid = element_blank())+
+geom_bar(stat='identity', alpha=0.5) +
+  # geom_text(aes(y='monetaryvalue', label='monetaryvalue'), size=6) +
+facet_grid('segmfreq ~ segmrec') +
+ggtitle("Summer Purchases by age group")+ theme(
+axis_text_x = element_blank()))
+print(plot2)
+
+lcgbonus=basetable.groupby(['segmfreq','segmrec','fallbonus','CustomerType'],observed=True,as_index=False).agg(quantity=('CustomerID','count'))
+
+lcgbonus['fallbonus'] = lcgbonus['fallbonus'].astype(str)
+plot3=(ggplot(lcgbonus, aes(x='fallbonus',fill='fallbonus', y='quantity')) +
+  theme_bw() +
+  theme(panel_grid = element_blank())+
+  geom_bar(stat='identity', alpha=0.5) +
+  # geom_text(aes(label='quantity'), size=6) +
+  facet_grid('segmfreq ~ segmrec') +
+  ggtitle("Fall Bonus"))
+print(plot3)
+
+basetable_to_use = ['CustomerID','segmfreq','segmrec','AgeGroup']
+summer_trx_groupMerged = pandas.merge(summer_trx_group, basetable[basetable_to_use], on=['CustomerID'], how='left')
+summer_trx_groupMerged['CustomerType'] = summer_trx_groupMerged['CustomerType'].astype(str)
+plot4=(ggplot(summer_trx_groupMerged, aes(x='CustomerType', fill='CustomerType', y='CustomerID')) +
+theme_bw() +
+theme(panel_grid = element_blank())+
+geom_bar(stat='identity', alpha=0.5) +
+  # geom_text(aes(label='np.round(CustomerID,1)'), size=6) +
+facet_grid('segmfreq ~ segmrec') +
+ggtitle("Life Cycle Grids: Number of Customers  by CustomerType"))
+print(plot4)
+
+
+plot5df = summer_trx_groupMerged.groupby(["segmrec","segmfreq","CustomerType"])['TransID'].count().reset_index()
+plot5df['CustomerType'] = plot5df['CustomerType'].astype(str)
+plot5=(ggplot(plot5df, aes(x='CustomerType', y='TransID',fill='CustomerType')) +
+theme_bw() +
+theme(panel_grid = element_blank())+
+geom_bar(stat='identity', alpha=0.5) +
+geom_text(aes(label='np.round(TransID,1)'), size=6) +
+facet_grid('segmfreq ~ segmrec') +
+ggtitle("Life Cycle Grids: Number of Transcations  by CustomerType"))
+print(plot5)
+
+plot6df = summer_trx_groupMerged.groupby(["segmrec","segmfreq","CustomerType"])['ProductID'].sum().reset_index()
+plot6df['CustomerType'] = plot6df['CustomerType'].astype(str)
+plot6df['ProductID'] = plot6df['ProductID'].round(0)
+plot6=(ggplot(plot6df, aes(x='CustomerType', y='ProductID',fill='CustomerType')) +
+  theme_bw() +
+  theme(panel_grid = element_blank())+
+  geom_bar(stat='identity', alpha=0.5) +
+  geom_text(aes(label='ProductID'), size=6) +
+  facet_grid('segmfreq ~ segmrec') +
+  ggtitle("Life Cycle Grids: Dollar Value of Transcations  by CustomerType"))
+print(plot6)
+
+plot7df = summer_trx_groupMerged.groupby(["segmrec","segmfreq","fallbonus"]).agg(NoTrx=('TransID','count')).reset_index()
+plot7df['fallbonus'] = plot7df['fallbonus'].astype(str)
+plot7=(ggplot(plot7df, aes(x='fallbonus', y='NoTrx',fill='fallbonus')) +
+  theme_bw() +
+  theme(panel_grid = element_blank())+
+  geom_bar(stat='identity', alpha=0.5) +
+  geom_text(aes(label='np.round(NoTrx,1)'), size=6) +
+  facet_grid('segmfreq ~ segmrec') +
+  ggtitle("Life Cycle Grids: Number of transaction / fall bonus' lifetime grid"))
+print(plot7)
+
+
+plot9df = summer_trx_groupMerged.groupby(["segmrec","segmfreq","AgeGroup"]).agg(NoTrx=('TransID','count')).reset_index()
+plot9=(ggplot(plot9df, aes(x='AgeGroup',y='NoTrx',fill='AgeGroup')) +
+  theme_bw() +
+  theme(panel_grid = element_blank())+
+  geom_bar(stat='identity', alpha=0.5) +
+  geom_text(aes(label='np.round(NoTrx,0)'), size=6) +
+  facet_grid('segmfreq ~ segmrec') +
+  ggtitle("Life Cycle Grids: Number of transaction By Age Category") + theme(
+  axis_text_x = element_blank()))
+print(plot9)
+plot10df = summer_trx_groupMerged.groupby(["segmrec","segmfreq","AgeGroup"]).agg(revenue=('ProductID','sum')).reset_index()
+plot10=(ggplot(plot10df, aes(x='AgeGroup',y='revenue',fill='AgeGroup')) +
+  theme_bw() +
+  theme(panel_grid = element_blank())+
+  geom_bar(stat='identity', alpha=0.5) +
+  # geom_text(aes(label='np.round(revenue,1)'), size=6) +
+  facet_grid('segmfreq ~ segmrec') +
+  ggtitle("Life Cycle Grids: Dollar Value of Transcations By Age Category") + theme(
+  axis_text_x = element_blank()))
+print(plot10)
+
+plot9df = summer_trx_groupMerged.groupby(["segmrec","segmfreq","Sex"]).agg(NoTrx=('TransID','count')).reset_index()
+plot9=(ggplot(plot9df, aes(x='Sex',y='NoTrx',fill='Sex')) +
+  theme_bw() +
+  theme(panel_grid = element_blank())+
+  geom_bar(stat='identity', alpha=0.5) +
+  geom_text(aes(label='np.round(NoTrx,0)'), size=6) +
+  facet_grid('segmfreq ~ segmrec') +
+  ggtitle("Life Cycle Grids: Number of transaction By Gender") + theme(
+  axis_text_x = element_blank()))
+print(plot9)
+plot10df = summer_trx_groupMerged.groupby(["segmrec","segmfreq","Sex"]).agg(revenue=('ProductID','sum')).reset_index()
+plot10=(ggplot(plot10df, aes(x='Sex',y='revenue',fill='Sex')) +
+  theme_bw() +
+  theme(panel_grid = element_blank())+
+  geom_bar(stat='identity', alpha=0.5) +
+  # geom_text(aes(label='np.round(revenue,1)'), size=6) +
+  facet_grid('segmfreq ~ segmrec') +
+  ggtitle("Life Cycle Grids: Dollar Value of Transcations By Gender") + theme(
+  axis_text_x = element_blank()))
+print(plot10)
+
+
+
+
+basetable_to_use = ["CustomerID","CustomerType","segmfreq","segmrec"]
+summersesstrxMerged = summersesstrx.merge(basetable[basetable_to_use],on=['CustomerID'])
+plot9df = summersesstrxMerged.groupby(["segmrec","segmfreq","CustomerType"]).agg(NumberSessions=('PlayID','count')).reset_index()
+plot13=(ggplot(plot9df, aes(x='CustomerType',y='NumberSessions',fill='CustomerType')) +
+  theme_bw() +
+  theme(panel_grid = element_blank())+
+  geom_bar(stat='identity', alpha=0.5) +
+  geom_text(aes(label='np.round(NumberSessions,0)'), size=6) +
+  facet_grid('segmfreq ~ segmrec') +
+  ggtitle("Life Cycle Grids: Number of Sessions by Customer Category") + theme(
+  axis_text_x = element_blank()))
+print(plot13)
+
+
+
+
+
